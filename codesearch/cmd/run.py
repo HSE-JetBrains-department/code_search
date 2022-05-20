@@ -1,20 +1,28 @@
-import datetime
 import json
 import os
 from pprint import pprint
 
 import click
+import pygments
+from pygments.formatters.terminal256 import Terminal256Formatter
+from pygments.lexers.python import PythonLexer
+from pygments.styles import get_style_by_name
 from tqdm import tqdm
 
 import codesearch.constants as consts
 from codesearch.es.client import ElasticSearchClient
+from codesearch.es.metrics.create_noise import corrupt_text, get_most_common_synonyms
+from codesearch.es.metrics.evaluation import find_best_params, make_search_query_func, top_n
+from codesearch.es.metrics.extract_data import dataset_to_elastic, make_dataset_for_evaluation
 from codesearch.preproc.extract import extract_from_csv
 
 ES = ElasticSearchClient()
+LEXER = PythonLexer()
+FORMATTER = Terminal256Formatter(style=get_style_by_name("dracula"))
 
 
 @click.group()
-def cs():
+def cs() -> None:
     """
     A command of type group. All others are attached to it.
     """
@@ -23,7 +31,7 @@ def cs():
 
 @cs.command()
 @click.argument("index_name")
-def init(index_name: str):
+def init(index_name: str) -> None:
     """
     Initialize elastic index with given name
     Args:
@@ -34,7 +42,7 @@ def init(index_name: str):
 
 @cs.command()
 @click.argument("index_name")
-def delete(index_name: str):
+def delete(index_name: str) -> None:
     """
     Delete elastic index with given name
     Args:
@@ -46,7 +54,7 @@ def delete(index_name: str):
 @cs.command()
 @click.argument("index_name")
 @click.argument("output_directory", type=click.Path(exists=True))
-def put(index_name: str, output_directory: str):
+def put(index_name: str, output_directory: str) -> None:
     """
     Put to elastic index entities from directory with jsons
     Args:
@@ -58,7 +66,7 @@ def put(index_name: str, output_directory: str):
     for file in tqdm(os.listdir(directory)):
         filename = os.fsdecode(file)
         if filename.endswith(".json"):
-            with open(f'{output_directory}/{filename}', encoding='utf-8') as json_file:
+            with open(f"{output_directory}/{filename}", encoding="utf-8") as json_file:
                 data = json.load(json_file)
                 print(ES.load_data(index_name, data))
 
@@ -66,35 +74,24 @@ def put(index_name: str, output_directory: str):
 @cs.command()
 @click.argument("index_name")
 @click.argument("search_request")
-def search(index_name: str, search_request: str):
+@click.option("--search_mode", "-m", default=0,
+              type=click.Choice([consts.REALISE_SEARCH_MODE, consts.EXPLAIN_SEARCH_MODE, consts.TIMINGS_SEARCH_MODE]))
+def search(index_name: str, search_request: str, search_mode: int = 0) -> None:
     """
     Args:
         search_request: request as a string
         index_name: index in which documents are searched
+        search_mode: mode of search (0 - just search, 1 - with timings, 2 - explain elastic score)
     """
-    pprint(ES.search(index_name, search_request, consts.REALISE_SEARCH_MODE))
+    pprint(ES.search(index_name, search_request, search_mode))
 
 
 @cs.command()
 @click.argument("index_name")
-@click.argument("search_request")
-def explain(index_name: str, search_request: str):
-    """
-    Same as search but save explain in es/explain_plans
-    """
-    pprint(ES.search(index_name, search_request, consts.EXPLAIN_SEARCH_MODE))
-
-@cs.command()
-@click.argument("index_name")
-@click.argument("search_request")
-def time(index_name: str, search_request: str):
-    pprint(ES.search(index_name, search_request, consts.TIMINGS_SEARCH_MODE))
-
-
-@cs.command()
-@click.argument("index_name")
-@click.argument("path_to_json_request", type=click.Path(exists=True))
-def search2(index_name: str, path_to_json_request: str):
+@click.option("--path_to_json_request", "-p", type=click.Path(exists=True), default=None)
+@click.option("--search_query", "-q", default=None)
+@click.option("--colors", "-c", default=False)
+def search_doc(index_name: str, path_to_json_request: str, search_query: str, colors: bool) -> None:
     """
     Args:
         index_name: index where we search
@@ -111,17 +108,39 @@ def search2(index_name: str, path_to_json_request: str):
               "from": 500,
               "to" : 10000
             },
-            "location": {todo}
           }
         }
-        // todo - add validation via pydantic
+        search_query: or exact query instead of path to doc
+        colors: should command color output
 
     Returns: request result
 
     """
-    with open(path_to_json_request, 'r') as f:
-        data = json.load(f)
-    pprint(ES.search_doc(index_name, data))
+    if path_to_json_request is None and search_query is None:
+        raise ValueError("You should specify path to request or query!")
+
+    if search_query is None:
+        with open(path_to_json_request, "r") as f:
+            data = json.load(f)
+    else:
+        data = {"query": search_query, "from": 0, "size": 5,
+                "filters": {"language": ["Python", "C++"],
+                            "stargazers_count": {"from": 0}
+                            }
+                }
+
+    result = ES.search_doc(index_name, data)
+
+    for doc in result:
+        for key in doc:
+            if colors:
+                value = doc[key]
+                if key == "function_body":
+                    value = f"\n{pygments.highlight(doc[key], LEXER, FORMATTER)}"
+                print(f"\033[93m{key}\033[0m: {value}")
+            else:
+                print(f"{key}: {doc[key]}")
+        print()
 
 
 @cs.command()
@@ -129,9 +148,9 @@ def search2(index_name: str, path_to_json_request: str):
 @click.argument("storage_path", type=click.Path(exists=True))
 @click.argument("output_path", type=click.Path(exists=True))
 @click.argument("file_size_mb", default=1024)
-def extract(csv_path: str, storage_path: str, output_path: str, file_size_mb: int):
+def extract(csv_path: str, storage_path: str, output_path: str, file_size_mb: int) -> None:
     """
-    Extract data from scv file
+    Extract data from csv file
     Args:
         csv_path: path to csv file with repos
         storage_path: path where to store repos
@@ -139,3 +158,80 @@ def extract(csv_path: str, storage_path: str, output_path: str, file_size_mb: in
         file_size_mb: size of each json file
     """
     extract_from_csv(csv_path, storage_path, output_path, file_size_mb)
+
+
+@cs.command()
+@click.argument("index_name")
+@click.argument("path_to_dataset_folder")
+def fill_train_dataset(index_name: str, path_to_dataset_folder: str) -> None:
+    """
+    This method fills index with entities from CodeSearchNet
+    Args:
+        index_name: name of index to fill
+        path_to_dataset_folder: path to CodeSearchNet dataset
+    """
+    data = dataset_to_elastic(path_to_dataset_folder)
+    for entity in tqdm(data):
+        ES.instance.index(index=index_name, document=entity)
+
+
+@cs.command()
+@click.argument("index_name")
+@click.argument("path_to_dataset_folder", type=click.Path(exists=True))
+@click.argument("path_to_grid", type=click.Path(exists=True))
+@click.option("--train_len", "-l", default=1000)
+@click.option("--n", "-n", default=10)
+@click.option("--query_max_length", "-q", default=30)
+@click.option("--max_evals", "-e", default=30)
+@click.option("--corrupt_probability", "-p", default=0, type=float)
+@click.option("--corrupt_test", "-t", default=False, type=bool)
+def evaluate_index(index_name: str,
+                   path_to_dataset_folder: str,
+                   path_to_grid: str,
+                   train_len: int = 1000,
+                   n: int = 10,
+                   query_max_length: int = 30,
+                   max_evals: int = 50,
+                   corrupt_probability: float = 0,
+                   corrupt_test: bool = False) -> None:
+    """
+    This method takes CodeSearchNet dataset and make a smaller dataset to evaluate Elasticsearch given index and
+    search query defined in codesearch.es.metrics.evaluation.make_search_query_func via top_n metric
+    (actually you can use this method for two things: 1) evaluate index 2) calculate best parameters
+    Args:
+        index_name: name of index where CodeSearchNet dataset already stored
+        path_to_dataset_folder: path to CodeSearchNet dataset
+        path_to_grid: path to grid of optimized params
+        train_len: length of train index
+        n: n in top_n metric
+        query_max_length: docstring trimmed to the query of this length
+        max_evals: maximum count of evaluations (set to 1 if your grid has only one combination of values)
+        corrupt_probability:
+        corrupt_test: should we also corrupt
+    Returns: this method will print optimal grid of params and top_n metric
+    """
+    train_dataset, test_dataset = make_dataset_for_evaluation(path_to_dataset_folder)
+
+    with open(path_to_grid, "r") as f:
+        grid = json.load(f)
+
+    if corrupt_probability > 0:
+        synonyms = get_most_common_synonyms([el["query"] for el in train_dataset], 100)  # todo make 100 as a parameter
+    else:
+        synonyms = None
+
+    train_score, params = find_best_params(train_dataset, train_len, ES, index_name, grid, n, query_max_length,
+                                           max_evals, synonyms, corrupt_probability)
+
+    print("params: ", params)
+    print(f"train top_{n} = {train_score}")
+
+    params["size"] = n
+
+    for i, el in enumerate(test_dataset):
+        if synonyms is not None and corrupt_probability != 0 and corrupt_test:
+            test_dataset[i]["query"] = corrupt_text(test_dataset[i]["query"], synonyms, corrupt_probability)
+        test_dataset[i]["query"] = test_dataset[i]["query"][:query_max_length]
+
+    score = top_n(test_dataset, make_search_query_func(**params), ES, index_name, n)
+    print(f"test top_{n}={score}")

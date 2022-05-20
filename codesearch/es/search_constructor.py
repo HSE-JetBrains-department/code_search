@@ -1,9 +1,9 @@
-from typing import Dict, List
+from typing import Any, Dict, List
 
 
 class SearchConstructor:
     @classmethod
-    def make_query(cls, data: Dict):
+    def make_query(cls, data: Dict) -> Dict[str, Any]:
         """
         Make elastic query from given request
         Args:
@@ -26,13 +26,18 @@ class SearchConstructor:
                         "multi_match": {
                             "query": query,
                             "fields": [
-                                "docstring^4",
-                                "identifiers",
+                                # exact occurrence
+                                "identifiers^1",
                                 "split_identifiers^2",
-                                "function_name"
+                                "function_body^2",
+                                # meaning
+                                "docstring^12",
+                                "location^3",
+                                "function_name^5",
                             ],
+                            "type": "most_fields",
                             "fuzziness": "AUTO",
-                            "prefix_length": 2
+                            "prefix_length": 3
                         }
                     },
                     "filter": {
@@ -47,7 +52,7 @@ class SearchConstructor:
         }
 
     @classmethod
-    def add_filters(cls, filters: List, data: Dict):
+    def add_filters(cls, filters: List, data: Dict) -> None:
         """
         Add filters to query body
         Args:
